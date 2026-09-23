@@ -1,5 +1,6 @@
 2.0.0 23sep2026
 * require pyusb 1.3.1 (Python >= 3.9)
+* replace the pyusb 0.x compatibility API with usb.core
 
 1.4.2 25may2020
 * update for weewx4 and python3

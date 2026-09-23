@@ -1188,7 +1188,9 @@ import sys
 import threading
 import time
 import traceback
-import usb
+import usb.control
+import usb.core
+import usb.util
 
 try:
     # Python 3
@@ -3005,10 +3007,27 @@ class LastStat(object):
 class Transceiver(object):
     """USB dongle abstraction"""
 
+    # Class requests to the interface. These match the pyusb 0.x values
+    # TYPE_CLASS + RECIP_INTERFACE, with ENDPOINT_IN set for reads.
+    _REQ_OUT = usb.util.build_request_type(
+        usb.util.CTRL_OUT, usb.util.CTRL_TYPE_CLASS, usb.util.CTRL_RECIPIENT_INTERFACE)
+    _REQ_IN = usb.util.build_request_type(
+        usb.util.CTRL_IN, usb.util.CTRL_TYPE_CLASS, usb.util.CTRL_RECIPIENT_INTERFACE)
+
     def __init__(self):
         self.devh = None
         self.timeout = 1000
         self.last_dump = None
+
+    @staticmethod
+    def _ctrl_out(dev, request, buf, value, timeout):
+        dev.ctrl_transfer(Transceiver._REQ_OUT, request, value, 0, buf, timeout)
+
+    @staticmethod
+    def _ctrl_in(dev, length, value, timeout):
+        # bRequest 0x01 is the value the 0.x code sent as REQ_CLEAR_FEATURE.
+        data = dev.ctrl_transfer(Transceiver._REQ_IN, 0x01, value, 0, length, timeout)
+        return list(data)
 
     def open(self, vid, pid, serial):
         device = Transceiver._find_device(vid, pid, serial)
@@ -3024,22 +3043,18 @@ class Transceiver(object):
 
     @staticmethod
     def _find_device(vid, pid, serial):
-        for bus in usb.busses():
-            for dev in bus.devices:
-                if dev.idVendor == vid and dev.idProduct == pid:
-                    if serial is None:
-                        loginf('found transceiver at bus=%s device=%s' %
-                               (bus.dirname, dev.filename))
-                        return dev
-                    else:
-                        sn = Transceiver._read_serial(dev)
-                        if str(serial) == sn:
-                            loginf('found transceiver at bus=%s device=%s serial=%s' %
-                                   (bus.dirname, dev.filename, sn))
-                            return dev
-                        else:
-                            loginf('skipping transceiver with serial %s (looking for %s)' %
-                                   (sn, serial))
+        for dev in usb.core.find(find_all=True, idVendor=vid, idProduct=pid):
+            if serial is None:
+                loginf('found transceiver at bus=%s address=%s' %
+                       (dev.bus, dev.address))
+                return dev
+            sn = Transceiver._read_serial(dev)
+            if str(serial) == sn:
+                loginf('found transceiver at bus=%s address=%s serial=%s' %
+                       (dev.bus, dev.address, sn))
+                return dev
+            loginf('skipping transceiver with serial %s (looking for %s)' %
+                   (sn, serial))
         return None
 
     @staticmethod
@@ -3053,7 +3068,7 @@ class Transceiver(object):
             buf = Transceiver.readCfg(handle, 0x1F9, 7)
             if buf:
                 return ''.join(['%02d' % x for x in buf[0:7]])
-        except usb.USBError as e:
+        except usb.core.USBError as e:
             logerr("cannot read serial number: %s" % e)
         finally:
             # if we claimed the interface, we must release it
@@ -3065,86 +3080,67 @@ class Transceiver(object):
 
     @staticmethod
     def _open_device(dev, interface=0):
-        handle = dev.open()
-        if not handle:
-            raise weewx.WeeWxIOError('Open USB device failed')
-
-        loginf('manufacturer: %s' % handle.getString(dev.iManufacturer, 30))
-        loginf('product: %s' % handle.getString(dev.iProduct, 30))
+        loginf('manufacturer: %s' % usb.util.get_string(dev, dev.iManufacturer))
+        loginf('product: %s' % usb.util.get_string(dev, dev.iProduct))
         loginf('interface: %d' % interface)
 
         # be sure kernel does not claim the interface
         try:
-            handle.detachKernelDriver(interface)
-        except usb.USBError:
+            if dev.is_kernel_driver_active(interface):
+                dev.detach_kernel_driver(interface)
+        except (usb.core.USBError, NotImplementedError):
             pass
 
         # attempt to claim the interface
         try:
             logdbg('claiming USB interface %d' % interface)
-            handle.claimInterface(interface)
-            handle.setAltInterface(interface)
-        except usb.USBError as e:
-            Transceiver._close_device(handle)
+            usb.util.claim_interface(dev, interface)
+            dev.set_interface_altsetting(interface, interface)
+        except usb.core.USBError as e:
+            Transceiver._close_device(dev, interface)
             logcrt('Unable to claim USB interface %s: %s' % (interface, e))
             raise weewx.WeeWxIOError(e)
 
         # FIXME: check return values
         usb_wait = 0.05
-        handle.getDescriptor(0x1, 0, 0x12)
+        usb.control.get_descriptor(dev, 0x12, 0x01, 0)
         time.sleep(usb_wait)
-        handle.getDescriptor(0x2, 0, 0x9)
+        usb.control.get_descriptor(dev, 0x09, 0x02, 0)
         time.sleep(usb_wait)
-        handle.getDescriptor(0x2, 0, 0x22)
+        usb.control.get_descriptor(dev, 0x22, 0x02, 0)
         time.sleep(usb_wait)
-        handle.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                          0xa, [], 0x0, 0x0, 1000)
+        Transceiver._ctrl_out(dev, 0x0a, [], 0, 1000)
         time.sleep(usb_wait)
-        handle.getDescriptor(0x22, 0, 0x2a9)
+        usb.control.get_descriptor(dev, 0x2a9, 0x22, 0)
         time.sleep(usb_wait)
-        return handle
+        return dev
 
     @staticmethod
-    def _close_device(handle):
-        if handle is not None:
+    def _close_device(dev, interface=0):
+        if dev is not None:
             try:
                 logdbg('releasing USB interface')
-                handle.releaseInterface()
-            except usb.USBError:
+                usb.util.release_interface(dev, interface)
+            except usb.core.USBError:
                 pass
+            usb.util.dispose_resources(dev)
 
     def setTX(self):
         buf = [0] * 0x15
         buf[0] = 0xD1
         if DEBUG_COMM > 1:
             self.dump('setTX', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d1,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d1, self.timeout)
 
     def setRX(self):
         buf = [0] * 0x15
         buf[0] = 0xD0
         if DEBUG_COMM > 1:
             self.dump('setRX', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d0,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d0, self.timeout)
 
     def getState(self):
-        buf = self.devh.controlMsg(
-            requestType=usb.TYPE_CLASS | usb.RECIP_INTERFACE | usb.ENDPOINT_IN,
-            request=usb.REQ_CLEAR_FEATURE,
-            buffer=0x0a,
-            value=0x00003de,
-            index=0x0000000,
-            timeout=self.timeout)
+        buf = self._ctrl_in(self.devh, 0x0a, 0x03de, self.timeout)
         if DEBUG_COMM > 1:
             self.dump('getState', buf, fmt=DEBUG_DUMP_FORMAT)
         return buf[1:3]
@@ -3159,19 +3155,8 @@ class Transceiver(object):
             buf[3] = (addr >> 0) & 0xFF
             if DEBUG_COMM > 1:
                 self.dump('readCfgFlash>', buf, fmt=DEBUG_DUMP_FORMAT)
-            self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                                 request=0x0000009,
-                                 buffer=buf,
-                                 value=0x00003dd,
-                                 index=0x0000000,
-                                 timeout=self.timeout)
-            buf = self.devh.controlMsg(
-                usb.TYPE_CLASS | usb.RECIP_INTERFACE | usb.ENDPOINT_IN,
-                request=usb.REQ_CLEAR_FEATURE,
-                buffer=0x15,
-                value=0x00003dc,
-                index=0x0000000,
-                timeout=self.timeout)
+            self._ctrl_out(self.devh, 0x09, buf, 0x03dd, self.timeout)
+            buf = self._ctrl_in(self.devh, 0x15, 0x03dc, self.timeout)
             new_data = [0] * 0x15
             if nbytes < 16:
                 for i in range(0, nbytes):
@@ -3192,12 +3177,7 @@ class Transceiver(object):
         buf[1] = state
         if DEBUG_COMM > 1:
             self.dump('setState', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d7,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d7, self.timeout)
 
     def setFrame(self, nbytes, data):
         buf = [0] * 0x111
@@ -3210,21 +3190,10 @@ class Transceiver(object):
             self.dump('setFrame', buf, 'short')
         elif DEBUG_COMM > 1:
             self.dump('setFrame', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d5,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d5, self.timeout)
 
     def getFrame(self):
-        buf = self.devh.controlMsg(
-            usb.TYPE_CLASS | usb.RECIP_INTERFACE | usb.ENDPOINT_IN,
-            request=usb.REQ_CLEAR_FEATURE,
-            buffer=0x111,
-            value=0x00003d6,
-            index=0x0000000,
-            timeout=self.timeout)
+        buf = self._ctrl_in(self.devh, 0x111, 0x03d6, self.timeout)
         data = [0] * 0x131
         nbytes = (buf[1] << 8 | buf[2]) & 0x1ff
         for i in range(0, nbytes):
@@ -3244,12 +3213,7 @@ class Transceiver(object):
         buf[4] = 0x00
         if DEBUG_COMM > 1:
             self.dump('writeReg', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003f0,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03f0, self.timeout)
 
     def execute(self, command):
         buf = [0] * 0x0f  # 0x15
@@ -3257,12 +3221,7 @@ class Transceiver(object):
         buf[1] = command
         if DEBUG_COMM > 1:
             self.dump('execute', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d9,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d9, self.timeout)
 
     def setPreamblePattern(self, pattern):
         buf = [0] * 0x15
@@ -3270,12 +3229,7 @@ class Transceiver(object):
         buf[1] = pattern
         if DEBUG_COMM > 1:
             self.dump('setPreamble', buf, fmt=DEBUG_DUMP_FORMAT)
-        self.devh.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                             request=0x0000009,
-                             buffer=buf,
-                             value=0x00003d8,
-                             index=0x0000000,
-                             timeout=self.timeout)
+        self._ctrl_out(self.devh, 0x09, buf, 0x03d8, self.timeout)
 
     # three formats, long, short, auto.  short shows only the first 16 bytes.
     # long shows the full length of the buffer.  auto shows the message length
@@ -3323,19 +3277,8 @@ class Transceiver(object):
             buf[1] = 0x0a
             buf[2] = (addr >> 8) & 0xFF
             buf[3] = (addr >> 0) & 0xFF
-            handle.controlMsg(usb.TYPE_CLASS + usb.RECIP_INTERFACE,
-                              request=0x0000009,
-                              buffer=buf,
-                              value=0x00003dd,
-                              index=0x0000000,
-                              timeout=timeout)
-            buf = handle.controlMsg(
-                usb.TYPE_CLASS | usb.RECIP_INTERFACE | usb.ENDPOINT_IN,
-                request=usb.REQ_CLEAR_FEATURE,
-                buffer=0x15,
-                value=0x00003dc,
-                index=0x0000000,
-                timeout=timeout)
+            Transceiver._ctrl_out(handle, 0x09, buf, 0x03dd, timeout)
+            buf = Transceiver._ctrl_in(handle, 0x15, 0x03dc, timeout)
             new_data = [0] * 0x15
             if nbytes < 16:
                 for i in range(0, nbytes):
