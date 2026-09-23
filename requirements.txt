@@ -1,0 +1,3 @@
+# USB access for the KlimaLogg transceiver.
+# pyusb 1.3.1 still exposes the legacy API used by bin/user/kl.py.
+pyusb==1.3.1

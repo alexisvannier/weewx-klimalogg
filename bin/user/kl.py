@@ -1235,7 +1235,7 @@ except ImportError:
         logmsg(syslog.LOG_ERR, msg)
 
 DRIVER_NAME = 'KlimaLogg'
-DRIVER_VERSION = '1.4.2'
+DRIVER_VERSION = '2.0.0'
 
 
 def loader(config_dict, _):
